@@ -1,0 +1,113 @@
+name: Fork release
+
+# Builds this fork (upstream main with the `mine` branch rebased on top) and
+# publishes it as a nightly-channel GitHub Release. The desktop build points its
+# updater at GITHUB_REPOSITORY, so installed builds update from this fork.
+#
+# The rebase only exists inside the job: pushing it would need a token with the
+# `workflows` scope whenever upstream touches .github/workflows. When it
+# conflicts, rebase `mine` locally and push.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  push:
+    branches: [mine]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-release
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Optional T3 Connect config; leave the repository variables unset to
+      # build without it.
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ vars.T3CODE_CLERK_PUBLISHABLE_KEY }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ vars.T3CODE_CLERK_JWT_TEMPLATE }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
+      T3CODE_RELAY_URL: ${{ vars.T3CODE_RELAY_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: mine
+          fetch-depth: 0
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Rebase onto upstream
+        id: source
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mine_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags https://github.com/pingdotgg/t3code.git main
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+          git rebase FETCH_HEAD
+
+          stamp="upstream ${upstream_sha} + mine ${mine_sha}"
+          echo "mine_sha=$mine_sha" >> "$GITHUB_OUTPUT"
+          echo "stamp=$stamp" >> "$GITHUB_OUTPUT"
+
+          last_tag="$(gh release list --limit 1 --json tagName -q '.[0].tagName')"
+          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" && -n "$last_tag" ]] &&
+            gh release view "$last_tag" --json body -q .body | grep -qF "$stamp"; then
+            echo "Already released $stamp."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Vite+
+        if: steps.source.outputs.skip != 'true'
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Setup Rust
+        if: steps.source.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        if: steps.source.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev pkg-config imagemagick
+          vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Resolve version
+        if: steps.source.outputs.skip != 'true'
+        id: version
+        run: |
+          node scripts/resolve-nightly-release.ts \
+            --date "$(date -u +%Y%m%d)" \
+            --run-number "$GITHUB_RUN_NUMBER" \
+            --sha "$(git rev-parse HEAD)" \
+            --github-output
+          node scripts/update-release-package-versions.ts "$(grep '^version=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
+
+      - name: Build Linux AppImage
+        if: steps.source.outputs.skip != 'true'
+        run: vp run dist:desktop:artifact --platform linux --target AppImage --arch x64 --build-version "${{ steps.version.outputs.version }}" --verbose
+
+      - name: Publish release
+        if: steps.source.outputs.skip != 'true'
+        run: |
+          shopt -s extglob nullglob
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --target "${{ steps.source.outputs.mine_sha }}" \
+            --prerelease \
+            --title "${{ steps.version.outputs.name }}" \
+            --notes "Built from ${{ steps.source.outputs.stamp }}." \
+            release/*.AppImage release/!(builder-debug).yml release/*.blockmap
