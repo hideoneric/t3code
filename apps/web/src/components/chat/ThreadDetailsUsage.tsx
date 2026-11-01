@@ -190,7 +190,7 @@ function UsageRow({
   /** Bar fill from 0 to 100. Null hides the bar. */
   readonly fill: number | null;
   readonly tone: UsageTone;
-  /** A marker on the bar, from 0 to 100: auto-compaction for context, window time left for limits. */
+  /** A marker on the bar, from 0 to 100. */
   readonly tick?: number | null;
   readonly value: string;
   readonly ariaValue?: string;
